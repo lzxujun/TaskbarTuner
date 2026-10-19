@@ -10,6 +10,7 @@
 
 #include <commctrl.h>
 #include <dwmapi.h>
+#include <shellapi.h>
 #include <windowsx.h>
 
 namespace tuner {
@@ -105,6 +106,10 @@ Palette NativePalette() {
 }
 
 Palette g_palette = NativePalette();
+
+// The project repository: the info button in the top right corner opens it
+// in the default browser.
+constexpr wchar_t kRepoUrl[] = L"https://github.com/lzxujun/TaskbarTuner";
 
 HPEN CreateRoundPen(COLORREF color, int width) {
     LOGBRUSH brush{};
@@ -729,12 +734,8 @@ void Panel::OnMouseDown(int x, int y) {
 
     RECT info = InfoButton();
     if (PtInRect(&info, point)) {
-        std::wstring text =
-            L"任务栏调节器 v" TUNER_VERSION_DOT3W L"\n\n"
-            L"独立的单文件任务栏外观调节工具。外观逻辑源自 Windhawk 模块 "
-            L"taskbar-brightness-and-opacity-tuner。\n\n"
-            L"拖动滑杆即时生效，无需重启资源管理器。";
-        MessageBoxW(m_hwnd, text.c_str(), L"关于", MB_OK | MB_ICONINFORMATION);
+        // Quick access to the project repository in the default browser.
+        ShellExecuteW(m_hwnd, L"open", kRepoUrl, nullptr, nullptr, SW_SHOWNORMAL);
         return;
     }
 

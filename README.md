@@ -1,37 +1,54 @@
 # Taskbar Tuner（任务栏调节器）2.0
 
-一个独立的 Windows 11 任务栏外观调节工具：托盘图标 + 自绘设置面板，单文件 exe，**不需要安装 Windhawk**。
+独立的 Windows 11 任务栏外观调节工具：托盘图标 + 设置面板，单文件 exe，**不需要安装 Windhawk**。
+
+> 调整任务栏背景与图标文字的不透明度，并可调暗任务栏背景，定制出简洁漂亮的任务栏——与桌面融为一体的任务栏，也更护眼、更适合 OLED 显示器。
 
 它直接改写任务栏的 XAML 视觉树和合成层，所以不需要改主题、不需要重启 explorer，拖动滑杆时任务栏立刻变化。
 
 ---
 
-## 和原来那个 exe 的关系
+## 来源与致谢
 
-这个工程是从原始 `TaskbarTuner.exe`（v1.1.5 资源 / v1.4.6 界面 / 配置版本 1166，三处版本号互相不一致）反向分析后重建的，功能与界面布局都对得上。
+核心逻辑移植自 Windhawk 官方模块库里的
+`mods/taskbar-brightness-and-opacity-tuner.wh.cpp`（作者 **lzxujun**，GPL-3.0，1,946 行），
+亮度与不透明度对任务栏背景的作用方式与该模块 1.13.0 保持一致，因此额外获得：
 
-核心逻辑不是凭空写的，来源是 Windhawk 官方模块库里的
-`mods/taskbar-brightness-and-opacity-tuner.wh.cpp`（作者 **lzxujun**，GPL-3.0，1,946 行）。
-"显示所有托盘图标"来自 m417z 的 `taskbar-notification-icons-show-all`。
-
-原 exe 的界面停在模块 v1.4.6 左右，而模块已经到 1.13.0。这个重建版直接对齐 **1.13.0**，因此额外获得：
-
-- v1.12.0 的修复：不再把整层透明度写到包含拖拽把手的元素上（旧版把 `GripperControl` 一起淡化，导致把手浮在任务栏上面，这就是旧 exe 里有个 `HideGrip` 开关的原因；现在把手单独处理）
+- v1.12.0 的修复：不再把整层透明度写到包含拖拽把手的元素上（`GripperControl` 单独处理，把手不会浮在任务栏上面）
 - 弹出层（悬停预览、托盘溢出菜单、Alt+Tab）被排除在调整范围外，不会在任务栏上方留下一条灰边
 - 图标层只在任务栏可见区域内生效，XAML 岛比任务栏高也不会溢出
 
+"显示所有托盘图标"来自 m417z 的 `taskbar-notification-icons-show-all`。
+
 ---
 
-## 为什么不再需要 PDB
+## 功能
 
-旧 exe 用 dbghelp 按修饰名查 `taskbar.dll` 的符号（`TaskbarHost::FrameHeight`、`CTaskBand::GetTaskbarHost` 等 9 个），这条路上有两个坑：
+任务栏被分成两个独立的层，各自用一个简单的 0–100 标尺调整：
+
+- **任务栏背景** —— 图标后面的那块材质。0 = 全透明，100 = 不变。
+- **图标和文字** —— 任务按钮、标签和系统托盘。0 = 全透明，100 = 不变。
+
+背景还可以在 0–100 的亮度标尺上**调暗**：0 = 调至全黑，100 = 不变。调暗作用的正是任务栏背景本身显示的内容，绝不是画在它上面的一层覆盖——低而暗的任务栏在夜间更护眼，也能减缓 OLED 烧屏。**只调暗，不调亮。**
+
+此外：
+
+- **显示任务栏顶部分隔线** —— 显示或隐藏任务栏顶缘的细线。
+- **显示所有托盘图标** —— 关闭托盘图标折叠，让全部图标直接显示在任务栏上。
+- **随 Windows 开机自动启动** —— 以托盘方式静默启动。
+
+关闭程序或恢复默认时会**精确还原**：改过什么就还原什么，用赋值而不是 `ClearValue`（模板元素持有本地值，`ClearValue` 会把填充直接抹掉）。若期间 Windows 自己改过同一个值（切主题、开关透明效果），比对当前值后再决定是否还原，不会用旧值覆盖新值。
+
+---
+
+## 为什么不依赖 PDB
+
+按符号查任务栏内部结构（`TaskbarHost::FrameHeight`、`CTaskBand::GetTaskbarHost` 等）这条路有两个天然的坑：
 
 1. Windows 不自带 `symsrv.dll`，dbghelp 连不上微软符号服务器，只能用磁盘上已有的 PDB；
-2. 它会捡到 `D:\系统工具\Windhawk\AppData\Engine\Symbols\Taskbar.pdb` 这个历史缓存，GUID/Age 对不上却仍然报告"符号已加载"，随后 6 个符号全部查询失败。
+2. 残留的历史缓存 PDB 即使 GUID/Age 对不上也可能被报告"符号已加载"，随后逐个符号查询失败。
 
-旧 exe 的实际表现正是如此：日志里 `Symbols loaded` 之后全是 not found，试 20 次放弃，`Enabled=0`，滑杆完全没反应。
-
-这个版本完全不走符号：从任务栏窗口的 user data 拿到 `CTaskBand` 对象，逐个指针槽位扫描找 `TaskbarHost`，再按一组候选偏移取元素指针，**每一个候选项都必须通过"QueryInterface 成 FrameworkElement → 有 XamlRoot → 树里能找到 BackgroundFill"的验证**才算数。验证不过就换下一个候选，不会误认，也不会调用到野指针（QI 包在 SEH 里，出错即返回失败）。
+所以这个版本完全不走符号：从任务栏窗口的 user data 拿到 `CTaskBand` 对象，逐个指针槽位扫描找 `TaskbarHost`，再按一组候选偏移取元素指针，**每一个候选项都必须通过"QueryInterface 成 FrameworkElement → 有 XamlRoot → 树里能找到 BackgroundFill"的验证**才算数。验证不过就换下一个候选，不会误认，也不会调用到野指针（QI 包在 SEH 里，出错即返回失败）。
 
 第一次探测成功后缓存布局（槽位 + 偏移），后续每次应用只要两次指针读取；布局失效会自动重扫。
 
@@ -138,6 +155,8 @@ acrylic tint dimmed FF202020 -> FF0D0D0D (scale=0.40)
 
 备注：亮度档位在窗口里是 0..100 的连续值（左边 0、右边 100），不吸附整数步进。
 
+全部回到中性值时会**精确还原**：改过什么就还原什么，用赋值而不是 `ClearValue`（模板元素持有本地值，`ClearValue` 会把填充直接抹掉）。若期间 Windows 自己改过同一个值（切主题、开关透明效果），比对当前值后再决定是否还原，不会用旧值覆盖新值。
+
 ---
 
 ## 使用
@@ -155,17 +174,14 @@ acrylic tint dimmed FF202020 -> FF0D0D0D (scale=0.40)
 | 显示所有托盘图标 | 批量把 `NotifyIconSettings\*\IsPromoted` 置 1，并备份原值 | 关 |
 | 随 Windows 开机自动启动 | `Run` 项里写 `"<路径>" --tray` | 关 |
 
-全部回到中性值时会**精确还原**：改过什么就还原什么，用赋值而不是 `ClearValue`（模板元素持有本地值，`ClearValue` 会把填充直接抹掉）。若期间 Windows 自己改过同一个值（切主题、开关透明效果），比对当前值后再决定是否还原，不会用旧值覆盖新值。
-
 ---
 
 ## 配置与日志
 
-- 配置：`HKCU\Software\TaskbarTuner`（与原程序同路径、同值名，可以直接接着用旧配置）
+- 配置：`HKCU\Software\TaskbarTuner`
   `Opacity` / `Brightness` / `IconOpacity` / `TopLine` / `HideGrip` / `ShowAllTray` / `Enabled` / `CfgVersion`
 
-  亮度现在按**窗口显示的范围**存（`0..100`，`100` = 不变）。旧格式存的是 `0..-100`（`0` = 不变），
-  加载时按 `CfgVersion` 自动换算一次并改写成新格式，所以旧配置不会突然变成全黑。
+  亮度按**窗口显示的范围**存（`0..100`，`100` = 不变，`0` = 全黑）。
 - 托盘图标备份：`HKCU\Software\TaskbarTuner\TrayIconsBackup`
 - 日志：`%LOCALAPPDATA%\TaskbarTuner\TaskbarTuner.log`（超过 1 MB 自动轮转）
   host 与 hook 写同一个文件，注入失败时两边的记录会挨在一起。
