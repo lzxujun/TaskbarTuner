@@ -1,0 +1,20 @@
+# Build output
+build/
+out/
+
+# Compiler / linker intermediates (in case of out-of-tree builds)
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Local logs and test artefacts
+*.log
+*.png.tmp
+verify_*.json
+
+# Editor / OS noise
+.vs/
+.vscode/
+Thumbs.db

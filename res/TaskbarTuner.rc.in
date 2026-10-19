@@ -1,0 +1,50 @@
+// Resource script. This is a template: CMake fills in @...@ with absolute
+// paths and writes the result into the build directory, because the hook DLL
+// does not exist yet when CMake configures the project.
+#include "resource.h"
+#include "version.h"
+
+// The application icon, also used for the tray icon.
+IDI_APP_ICON ICON "@TUNER_ICON@"
+
+// The hook DLL, embedded so that the shipped program is a single file. The
+// host unpacks it to %LOCALAPPDATA%\TaskbarTuner before injecting it.
+IDR_HOOK_DLL RCDATA "@TUNER_HOOK_DLL@"
+
+// Per-monitor DPI awareness and the common controls version 6 dependency.
+// 24 is RT_MANIFEST and 1 is CREATEPROCESS_MANIFEST_RESOURCE_ID; the numbers
+// are used directly because the resource compiler does not include windows.h.
+1 24 "@TUNER_MANIFEST@"
+
+1 VERSIONINFO
+ FILEVERSION TUNER_VERSION_COMMA4
+ PRODUCTVERSION TUNER_VERSION_COMMA4
+ FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS 0x1L
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName", "lzxujun"
+            VALUE "FileDescription", "Taskbar Tuner"
+            VALUE "FileVersion", TUNER_VERSION_DOT4
+            VALUE "InternalName", "TaskbarTuner"
+            VALUE "LegalCopyright", "GPL-3.0. Based on the Windhawk mod taskbar-brightness-and-opacity-tuner."
+            VALUE "OriginalFilename", "TaskbarTuner.exe"
+            VALUE "ProductName", "Taskbar Tuner"
+            VALUE "ProductVersion", TUNER_VERSION_DOT4
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END
