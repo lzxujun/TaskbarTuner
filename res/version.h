@@ -8,15 +8,15 @@
 
 #define TUNER_VERSION_MAJOR 2
 #define TUNER_VERSION_MINOR 0
-#define TUNER_VERSION_PATCH 0
+#define TUNER_VERSION_PATCH 1
 #define TUNER_VERSION_BUILD 0
 
 // The resource compiler cannot build strings out of macros, so the same numbers
 // appear once more in the form it needs. Keep them in sync with the values
 // above; nothing else in the project hardcodes a version.
-#define TUNER_VERSION_COMMA4 2, 0, 0, 0
-#define TUNER_VERSION_DOT3 "2.0.0"
-#define TUNER_VERSION_DOT4 "2.0.0.0"
+#define TUNER_VERSION_COMMA4 2, 0, 1, 0
+#define TUNER_VERSION_DOT3 "2.0.1"
+#define TUNER_VERSION_DOT4 "2.0.1.0"
 
 // Wide literal with the same text, for the title bar of the settings window.
-#define TUNER_VERSION_DOT3W L"2.0.0"
+#define TUNER_VERSION_DOT3W L"2.0.1"
