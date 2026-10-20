@@ -6,8 +6,7 @@
 
 它直接改写任务栏的 XAML 视觉树和合成层，所以不需要改主题、不需要重启 explorer，拖动滑杆时任务栏立刻变化。
 
-<img width="1230" height="72" alt="image" src="https://github.com/user-attachments/assets/fc475e51-0f93-47c0-9611-e747d42fe077" />
-
+<img width="977" height="180" alt="image" src="https://github.com/user-attachments/assets/d4f14153-ce11-4e41-83ef-68052dff32a7" />
 
 ## 来源与致谢
 
