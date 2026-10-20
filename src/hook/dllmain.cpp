@@ -9,8 +9,10 @@
 
 #include <atomic>
 #include <algorithm>
+#include <string>
 #include <vector>
 
+#include "Symbols.h"
 #include "TaskbarHost.h"
 #include "VisualTree.h"
 
@@ -33,11 +35,27 @@ std::atomic<bool> g_running{true};
 bool g_unload = false;
 tuner::Config g_config;
 
+// A pass lives on the heap, not on the worker thread's stack: the taskbar thread
+// may still be running it after SendMessageTimeout has given up waiting (a slow
+// first probe easily exceeds the timeout), and a stack object would be gone by
+// then while the taskbar thread kept writing to it.
 struct ApplyPass {
     HWND hwnd = nullptr;
     bool secondary = false;
     tuner::Config config;
-    tuner::hook::ApplyOutcome outcome = tuner::hook::ApplyOutcome::Failed;
+    std::atomic<tuner::hook::ApplyOutcome> outcome{
+        tuner::hook::ApplyOutcome::Failed};
+
+    void AddRef() { m_refs.fetch_add(1); }
+
+    void Release() {
+        if (m_refs.fetch_sub(1) == 1) {
+            delete this;
+        }
+    }
+
+private:
+    std::atomic<int> m_refs{1};
 };
 
 struct TrackedTaskbar {
@@ -102,10 +120,15 @@ void RunApplyPass(ApplyPass* pass) {
     pass->outcome = tuner::hook::ApplyConfig(root, pass->config);
 }
 
-// The pass that the worker thread is currently waiting for. Set before the
-// message is sent and cleared after it returns, so the hook only ever sees a
-// live pointer.
-ApplyPass* volatile g_pendingPass = nullptr;
+// The pass the taskbar thread has been handed, if any. Ownership moves through
+// an exchange: whoever takes the pointer out of the slot also owns one
+// reference, so the worker thread can safely walk away after a timeout.
+std::atomic<ApplyPass*> g_pendingPass{nullptr};
+
+// Set while a handoff may still be running on the taskbar thread. A second pass
+// is not started while this is set: if the taskbar thread is too busy to answer,
+// queueing more work on it only makes things worse.
+std::atomic<bool> g_passInFlight{false};
 
 // A thread-local hook is enough to get onto the taskbar's UI thread: the hook
 // procedure is called in the context of the thread that owns the window, and
@@ -114,15 +137,21 @@ ApplyPass* volatile g_pendingPass = nullptr;
 // comctl32 refuses to subclass the shell's taskbar window, so the work is
 // dispatched this way instead.
 LRESULT CALLBACK CallWndProc(int code, WPARAM wParam, LPARAM lParam) {
-    if (code == HC_ACTION && g_pendingPass) {
+    if (code == HC_ACTION) {
         const auto* cwp = reinterpret_cast<const CWPSTRUCT*>(lParam);
         if (cwp->message == g_runFromWindowThreadMsg) {
-            ApplyPass* pass = g_pendingPass;
-            try {
-                RunApplyPass(pass);
-            } catch (...) {
-                TLOG(L"apply pass threw");
-                pass->outcome = tuner::hook::ApplyOutcome::Failed;
+            // The exchange makes this the only taker: the worker thread can
+            // never free the pass underneath the apply that is still running.
+            ApplyPass* pass = g_pendingPass.exchange(nullptr);
+            if (pass) {
+                try {
+                    RunApplyPass(pass);
+                } catch (...) {
+                    TLOG(L"apply pass threw");
+                    pass->outcome = tuner::hook::ApplyOutcome::Failed;
+                }
+                g_passInFlight = false;
+                pass->Release();
             }
         }
     }
@@ -136,12 +165,19 @@ bool RunFromWindowThread(HWND hWnd, ApplyPass* pass) {
         return false;
     }
 
-    g_pendingPass = pass;
+    // One reference for the pending slot, one for the caller.
+    pass->AddRef();
+    g_pendingPass.store(pass);
+    g_passInFlight = true;
+
     HHOOK hook = SetWindowsHookExW(WH_CALLWNDPROC, CallWndProc, nullptr, thread);
     if (!hook) {
         TLOG(L"SetWindowsHookEx failed for thread %lu (error %lu)", thread,
              GetLastError());
-        g_pendingPass = nullptr;
+        if (g_pendingPass.exchange(nullptr) == pass) {
+            pass->Release();
+        }
+        g_passInFlight = false;
         return false;
     }
 
@@ -151,28 +187,48 @@ bool RunFromWindowThread(HWND hWnd, ApplyPass* pass) {
         5000, &result);
 
     UnhookWindowsHookEx(hook);
-    g_pendingPass = nullptr;
+
+    // If the pointer is still in the slot nobody took it, so the pending
+    // reference is still ours. Otherwise the taskbar thread owns it and will
+    // release it when it finishes - even if that happens after this return.
+    if (g_pendingPass.exchange(nullptr) == pass) {
+        g_passInFlight = false;
+        pass->Release();
+    }
 
     if (!sent) {
-        TLOG(L"SendMessageTimeout failed for %p (error %lu)", hWnd,
-             GetLastError());
+        TLOG(L"SendMessageTimeout failed for %p (error %lu); the apply may still "
+             L"be running on the taskbar thread",
+             hWnd, GetLastError());
     }
 
     return sent != 0;
 }
 
 void ApplyToTaskbar(HWND hwnd, bool secondary) {
-    ApplyPass pass;
-    pass.hwnd = hwnd;
-    pass.secondary = secondary;
-    pass.config = g_config;
-
-    if (!RunFromWindowThread(hwnd, &pass)) {
-        TLOG(L"could not reach the taskbar thread of %p", hwnd);
-        pass.outcome = tuner::hook::ApplyOutcome::Failed;
+    if (g_passInFlight) {
+        TLOG(L"previous apply on %p has not finished, skipping", hwnd);
+        return;
     }
 
-    switch (pass.outcome) {
+    auto* pass = new ApplyPass();
+    pass->hwnd = hwnd;
+    pass->secondary = secondary;
+    pass->config = g_config;
+
+    if (!RunFromWindowThread(hwnd, pass)) {
+        TLOG(L"could not reach the taskbar thread of %p", hwnd);
+        if (!g_passInFlight) {
+            pass->outcome = tuner::hook::ApplyOutcome::Failed;
+        }
+    }
+
+    // Read the outcome before dropping the last reference: after that the pass
+    // may already belong to the taskbar thread and be gone.
+    const auto outcome = pass->outcome.load();
+    pass->Release();
+
+    switch (outcome) {
         case tuner::hook::ApplyOutcome::Applied:
             TLOG(L"applied to %p", hwnd);
             break;
@@ -194,9 +250,9 @@ void ApplyToTaskbar(HWND hwnd, bool secondary) {
         if (entry.hwnd == hwnd) {
             // "Restored" is a success as well: it means the taskbar was
             // reached and put back, not that a probe failed.
-            const bool success = pass.outcome == tuner::hook::ApplyOutcome::Applied ||
-                                 pass.outcome == tuner::hook::ApplyOutcome::Restored;
-            entry.lastOutcome = pass.outcome;
+            const bool success = outcome == tuner::hook::ApplyOutcome::Applied ||
+                                 outcome == tuner::hook::ApplyOutcome::Restored;
+            entry.lastOutcome = outcome;
             entry.failures = success ? 0 : entry.failures + 1;
             entry.lastAttempt = GetTickCount64();
             entry.lastVerify = GetTickCount64();
@@ -207,12 +263,11 @@ void ApplyToTaskbar(HWND hwnd, bool secondary) {
     TrackedTaskbar entry;
     entry.hwnd = hwnd;
     entry.secondary = secondary;
-    entry.lastOutcome = pass.outcome;
-    entry.failures =
-        (pass.outcome == tuner::hook::ApplyOutcome::Applied ||
-         pass.outcome == tuner::hook::ApplyOutcome::Restored)
-            ? 0
-            : 1;
+    entry.lastOutcome = outcome;
+    entry.failures = (outcome == tuner::hook::ApplyOutcome::Applied ||
+                      outcome == tuner::hook::ApplyOutcome::Restored)
+                         ? 0
+                         : 1;
     entry.lastAttempt = GetTickCount64();
     entry.lastVerify = GetTickCount64();
     g_tracked.push_back(entry);
@@ -259,7 +314,6 @@ void PollTaskbars() {
                         });
 
         if (!known) {
-            tuner::hook::ResetProbeCache();
             ApplyToTaskbar(info.hwnd, info.secondary);
             continue;
         }
@@ -373,6 +427,18 @@ DWORD WINAPI WorkerThread(void* parameter) {
 
     tuner::LogInit(L"hook");
     TLOG(L"hook attached to pid %lu", GetCurrentProcessId());
+
+    // Resolved here, on this thread, on purpose: resolution may download the
+    // PDB and must never run on the taskbar's UI thread.
+    {
+        std::wstring symbolError;
+        if (tuner::hook::EnsureTaskbarSymbols(symbolError)) {
+            TLOG(L"symbols loaded from %s",
+                 tuner::hook::LoadedPdbPath().c_str());
+        } else {
+            TLOG(L"taskbar symbols unavailable: %s", symbolError.c_str());
+        }
+    }
 
     g_runFromWindowThreadMsg =
         RegisterWindowMessageW(L"TaskbarTuner_RunFromWindowThread");

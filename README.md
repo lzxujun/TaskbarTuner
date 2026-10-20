@@ -41,18 +41,22 @@
 
 ---
 
-## 为什么不依赖 PDB
+## 怎么定位任务栏对象（与 Windhawk 模块一致）
 
-按符号查任务栏内部结构（`TaskbarHost::FrameHeight`、`CTaskBand::GetTaskbarHost` 等）这条路有两个天然的坑：
+和上游模块 `taskbar-brightness-and-opacity-tuner` 一样，用 `taskbar.dll` 的符号来定位，不做任何猜测：
 
-1. Windows 不自带 `symsrv.dll`，dbghelp 连不上微软符号服务器，只能用磁盘上已有的 PDB；
-2. 残留的历史缓存 PDB 即使 GUID/Age 对不上也可能被报告"符号已加载"，随后逐个符号查询失败。
+1. 解析 `const CTaskBand::`vftable'{for `ITaskListWndSite'}` 的地址，在 CTaskBand 对象的前 20 个指针槽里找到 vftable 与之相等的子对象 —— 这就是 `GetTaskbarHost` 需要的 `this`；
+2. 直接调用 `CTaskBand::GetTaskbarHost()`，拿到 `shared_ptr<TaskbarHost>`；
+3. 按 `TaskbarHost::FrameHeight` 序言里的 `add rcx, xx` 读出元素的偏移（当前 build 是 `0x10`，早期 build 是 `0x48`），取到元素 IUnknown，`QueryInterface` 成 `FrameworkElement`；
+4. 用 `std::_Ref_count_base::_Decref` 释放第 2 步的引用。
 
-所以这个版本完全不走符号：从任务栏窗口的 user data 拿到 `CTaskBand` 对象，逐个指针槽位扫描找 `TaskbarHost`，再按一组候选偏移取元素指针，**每一个候选项都必须通过"QueryInterface 成 FrameworkElement → 有 XamlRoot → 树里能找到 BackgroundFill"的验证**才算数。验证不过就换下一个候选，不会误认，也不会调用到野指针（QI 包在 SEH 里，出错即返回失败）。
+验证过的对象，所以 `QueryInterface`、`XamlRoot()` 作用在真实对象上。
 
-第一次探测成功后缓存布局（槽位 + 偏移），后续每次应用只要两次指针读取；布局失效会自动重扫。
+**PDB 由程序自己下载。** Windows 自带 `dbghelp.dll` 却不带 `symsrv.dll`，dbghelp 因此连不上微软符号服务器——这是旧版本放弃符号的直接原因。现在改为：从 `taskbar.dll` 的 CodeView 记录读出 `<GUID><Age>`，直接向 `msdl.microsoft.com` 取对应的 `taskbar.pdb`，落到 `%LOCALAPPDATA%\TaskbarTuner\symbols\`，再交给 dbghelp 按普通本地文件加载。签名不匹配的 PDB 会被 dbghelp 自己拒掉，所以"符号显示已加载但每个查询都失败"那种情况不会再有。
 
-判定"这个指针是不是 XAML 对象"时，模块是按文件名（含 `xaml`）**逐次学习**的，而不是启动时一次性解析：任务栏的 XAML 是延迟加载的，如果注入早于它出现，一次性解析会记下一张空表，之后整个 explorer 进程内所有候选都会被否决（表现为"有时一次就中、有时怎么都不生效"，重启 explorer 才恢复）。现在这张表按需增长，永不锁死。
+符号只在 hook 的工作线程里解析一次（可能在 explorer 里下载几百 KB～几 MB），绝不在任务栏 UI 线程上做。
+
+> 历史说明：v2.0 曾经放弃符号，改成"扫描对象内存 + 用 QueryInterface 验证候选指针"。那条路径会让 explorer 崩溃：扫描会把"看起来像对象"的堆指针送去 `QueryInterface`，一次错误的 `AddRef`/`Release` 就破坏了 explorer 里活着的 XAML 对象的引用计数，随后 `Windows.UI.Xaml.dll` 内部整数除零（`0xC0000094`）把 explorer 带走。用编译开关逐层剥离可以确认：关掉探测就完全稳定，只探测不写入仍然崩。
 
 ---
 
@@ -74,7 +78,8 @@ TaskbarTuner/
 │  │  └─ Log.h/.cpp            同一份日志文件，host 与 hook 各写各的行
 │  ├─ hook/                    注入 explorer.exe 的 DLL
 │  │  ├─ dllmain.cpp           隐藏窗口、轮询、重试、消息处理
-│  │  ├─ TaskbarHost.cpp       免符号地定位 XamlRoot（上面那一节）
+│  │  ├─ Symbols.cpp           taskbar.dll 符号解析与 PDB 获取
+│  │  ├─ TaskbarHost.cpp       用符号定位 XamlRoot（上面那一节）
 │  │  ├─ VisualTree.cpp        视觉树调整与精确还原
 │  │  └─ BackdropBrush.cpp     ColorMatrix 合成特效（三档调暗策略的最后一档）
 │  └─ host/                    用户看到的程序
@@ -195,9 +200,11 @@ acrylic tint dimmed FF202020 -> FF0D0D0D (scale=0.40)
 常见原因：安全软件拦 `CreateRemoteThread`；程序与 explorer 权限不一致（这种情况请用同一账户、同样的完整性级别运行）。
 
 **注入成功但任务栏没变化**
-看日志里有没有 `no taskbar host found` 或 `taskbar host found: slot 0x.. offset 0x..`：
-- 前者说明这台机器的任务栏布局在这套候选偏移里没匹配上，属于需要补偏移的情况；
-- 后者加上 `icon and text layer is empty` 说明任务栏还没布局完，程序会在 1.2 秒后重试（连续失败 5 次后转为 30 秒一次，不再刷屏）。
+先看日志里符号有没有就位：
+- `taskbar symbols unavailable: ...` —— 符号没取到。可能没联网（PDB 需要从 `msdl.microsoft.com` 下载一次），或这个 build 的 PDB 没有发布。此时程序**不会**去碰任务栏，也不会用扫描兜底：兜底路径会破坏 explorer 的 XAML 状态。
+- `no ITaskListWndSite sub-object within 20 slots` —— 找到了 taskband 窗口，但 CTaskBand 的对象布局变了，需要按上游模块的做法核对虚表匹配。
+- `TaskbarHost+0x.. is not a FrameworkElement` —— 元素偏移没对上，`TaskbarHost::FrameHeight` 的序言格式变了（日志里会打印实际使用的偏移）。
+- `icon and text layer is empty, taskbar not laid out yet` —— 任务栏还没布局完，程序会在 1.2 秒后重试（连续失败 5 次后转为 30 秒一次，不再刷屏）。
 
 **explorer 重启后效果消失**
 程序在收到 `TaskbarCreated` 消息后会重新注入并推一次配置，等一两秒即可；托盘图标也会自动重新注册。
@@ -211,7 +218,8 @@ acrylic tint dimmed FF202020 -> FF0D0D0D (scale=0.40)
 
 - 仅 Windows 11（依赖 WinUI 任务栏的 XAML 结构，`BackgroundFill`/`BackgroundStroke` 这些元素名）
 - 仅 x64
-- 任务栏对象布局靠"候选偏移 + 严格验证"定位，微软大改内部结构时需要补一组候选偏移（改 `kElementOffsets` 一行）
+- 任务栏对象靠 `taskbar.dll` 的符号定位，微软大改内部结构（虚表、`GetTaskbarHost` 签名）时需要跟着上游模块更新符号名
+- 首次运行需要联网从微软符号服务器取一次 `taskbar.pdb`（约 7 MB，缓存在 `%LOCALAPPDATA%\TaskbarTuner\symbols`，之后离线可用）
 - 需要与 explorer 相同或更高的完整性级别
 
 ---

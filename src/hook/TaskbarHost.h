@@ -1,19 +1,17 @@
-// Locates the taskbar XamlRoot without a debugger, a PDB or a symbol server.
+// Locates the taskbar XamlRoot through taskbar.dll's own symbols.
 //
-// The original TaskbarTuner resolved taskbar.dll symbols with dbghelp and
-// called CTaskBand::GetTaskbarHost. That approach failed on this machine for a
-// reason that is easy to miss: Windows does not ship symsrv.dll, so dbghelp can
-// only use PDBs that already exist on disk. It found a stale Taskbar.pdb from
-// the Windhawk cache, marked the module as "symbols loaded", and then failed
-// every single query because the GUID did not match.
+// This follows the Windhawk module the program is based on: the symbol addresses
+// of CTaskBand's `ITaskListWndSite' vftable and of CTaskBand::GetTaskbarHost are
+// resolved once, the sub-object is identified by matching its vftable against
+// that address, and the host is then obtained by calling the real function.
 //
-// This module does not need any of that. The taskband window's user data is
-// the CTaskBand object; somewhere inside it lives the TaskbarHost, and inside
-// the TaskbarHost there is an IUnknown for the taskbar's root FrameworkElement.
-// Instead of knowing the exact layout, the object is walked slot by slot and
-// each candidate is validated against the live XAML tree. Only a pointer that
-// resolves to a real FrameworkElement whose XamlRoot has a BackgroundFill can
-// pass, so the false positive rate is effectively zero.
+// An earlier version replaced this with a "scan the object for something that
+// validates as XAML" heuristic, because symbols were believed to be unavailable
+// without symsrv.dll. That heuristic is dangerous in a way the symbol-based path
+// never is: it ends up calling QueryInterface on pointers that only look like
+// objects, and a wrong AddRef on a live XAML object corrupts explorer's XAML
+// state (observed as 0xC0000094 inside Windows.UI.Xaml.dll). Symbols are
+// therefore back, with the PDB fetched by the module itself (see Symbols.h).
 #pragma once
 
 #include <windows.h>
@@ -27,19 +25,5 @@ namespace tuner::hook {
 winrt::Windows::UI::Xaml::XamlRoot GetTaskbarXamlRoot(HWND hTaskbarWnd);
 winrt::Windows::UI::Xaml::XamlRoot GetSecondaryTaskbarXamlRoot(
     HWND hSecondaryTaskbarWnd);
-
-// Diagnostic counters for the log; the first probe is the only expensive one.
-struct ProbeStats {
-    int attempts = 0;
-    bool usedCache = false;
-    size_t hostSlot = 0;
-    size_t elementOffset = 0;
-};
-
-const ProbeStats& LastProbeStats();
-
-// Drops the cached layout, e.g. after explorer restarted or the taskbar was
-// rebuilt.
-void ResetProbeCache();
 
 }  // namespace tuner::hook

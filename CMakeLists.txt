@@ -29,7 +29,9 @@ add_compile_definitions(
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     # /utf-8 matters: the UI strings are Chinese and the sources are UTF-8.
-    add_compile_options(/utf-8 /permissive- /W4)
+    # /EHsc is spelled out because the hook mixes __try/__except around
+    # QueryInterface with ordinary try/catch.
+    add_compile_options(/utf-8 /permissive- /W4 /EHsc)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -38,6 +40,7 @@ endif()
 
 add_library(TaskbarTunerHook SHARED
     src/hook/dllmain.cpp
+    src/hook/Symbols.cpp
     src/hook/TaskbarHost.cpp
     src/hook/VisualTree.cpp
     src/hook/BackdropBrush.cpp
@@ -57,6 +60,10 @@ target_link_libraries(TaskbarTunerHook PRIVATE
     user32
     gdi32
     advapi32
+    # Taskbar objects are located through taskbar.dll's own symbols; the PDB is
+    # fetched by the module itself because Windows ships dbghelp without symsrv.
+    dbghelp
+    urlmon
 )
 
 # Fixed output directory regardless of configuration: the resource script needs
@@ -92,6 +99,11 @@ target_link_libraries(TaskbarTuner PRIVATE
     user32
     gdi32
 )
+
+# The manifest is embedded by the resource script above, so the linker must not
+# generate and embed a second one: newer toolchains do that by default and
+# cvtres then fails with CVT1100 "duplicate resource, type MANIFEST".
+target_link_options(TaskbarTuner PRIVATE /MANIFEST:NO)
 
 # The resource script embeds the DLL, so it can only be compiled once the DLL
 # exists. configure_file substitutes these three paths into the template.
