@@ -270,6 +270,21 @@ BOOL CALLBACK EnumProc(PSYMBOL_INFOW info, ULONG, PVOID userContext) {
     return FALSE;
 }
 
+// SizeOfImage of the mapped module, or 0 when the headers cannot be read.
+DWORD ImageSize(HMODULE module) {
+    const auto* base = reinterpret_cast<const BYTE*>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        return 0;
+    }
+
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        return 0;
+    }
+    return nt->OptionalHeader.SizeOfImage;
+}
+
 // One full resolution attempt: locate taskbar.dll, stage its PDB, load symbols.
 bool ResolveSymbolsOnce(std::wstring& error) {
     g_taskbarModule = GetModuleHandleW(L"taskbar.dll");
@@ -325,6 +340,13 @@ bool ResolveSymbolsOnce(std::wstring& error) {
         return false;
     }
 
+    const DWORD imageSizeBytes = ImageSize(g_taskbarModule);
+    if (!imageSizeBytes) {
+        error = L"无法读取 taskbar.dll 的映像大小";
+        return false;
+    }
+    const DWORD64 imageEnd = g_taskbarBase + imageSizeBytes;
+
     size_t missing = 0;
     for (const auto& request : kRequests) {
         void* address = nullptr;
@@ -354,6 +376,19 @@ bool ResolveSymbolsOnce(std::wstring& error) {
         if (!address) {
             missing++;
             TLOG(L"symbol not found: %s", request.mangled);
+            continue;
+        }
+
+        // The PDB is not trusted: the cache directory is an ordinary user
+        // directory, so a planted file could declare any address at all. Every
+        // resolved address has to land inside taskbar.dll itself, which is the
+        // same check Windhawk's symbol loader performs.
+        const DWORD64 addressValue = reinterpret_cast<DWORD64>(address);
+        if (addressValue < g_taskbarBase || addressValue >= imageEnd) {
+            missing++;
+            TLOG(L"symbol %s resolved to 0x%llX, outside taskbar.dll "
+                 L"(0x%llX..0x%llX)",
+                 request.mangled, addressValue, g_taskbarBase, imageEnd);
             continue;
         }
 
