@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(TaskbarTuner VERSION 2.0.0 LANGUAGES CXX RC)
+project(TaskbarTuner VERSION 2.0.3 LANGUAGES CXX RC)
 
 # The program is a single .exe, but it is built from two targets: a host
 # executable and a DLL that gets injected into explorer.exe. The DLL is embedded
