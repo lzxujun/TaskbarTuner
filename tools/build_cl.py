@@ -50,6 +50,7 @@ COMMON = [
 
 HOOK_SOURCES = [
     "src/hook/dllmain.cpp",
+    "src/hook/Symbols.cpp",
     "src/hook/TaskbarHost.cpp",
     "src/hook/VisualTree.cpp",
     "src/hook/BackdropBrush.cpp",

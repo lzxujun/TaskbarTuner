@@ -190,6 +190,12 @@ acrylic tint dimmed FF202020 -> FF0D0D0D (scale=0.40)
 - 托盘图标备份：`HKCU\Software\TaskbarTuner\TrayIconsBackup`
 - 日志：`%LOCALAPPDATA%\TaskbarTuner\TaskbarTuner.log`（超过 1 MB 自动轮转）
   host 与 hook 写同一个文件，注入失败时两边的记录会挨在一起。
+- 符号缓存：`%LOCALAPPDATA%\TaskbarTuner\symbols\Taskbar.pdb`，旁边还有一个
+  `Taskbar.pdb.key` 记录这份 PDB 属于哪个 `taskbar.dll`（32 位 GUID + Age）。
+  文件名必须是 CodeView 记录里的原名，所以归属信息只能放在这个旁路文件里。
+
+  **这两个文件是一对**：只删 `Taskbar.pdb` 会重新下载，只删 `.key` 也会重新下载；
+  手动替换 PDB 时要连 `.key` 一起写成新的签名，否则下次启动会被判定为过期。
 
 ---
 
@@ -199,9 +205,14 @@ acrylic tint dimmed FF202020 -> FF0D0D0D (scale=0.40)
 注入没成功。日志里会写明是哪一步：找不到任务栏窗口 / 打不开 explorer 进程 / 创建线程失败。
 常见原因：安全软件拦 `CreateRemoteThread`；程序与 explorer 权限不一致（这种情况请用同一账户、同样的完整性级别运行）。
 
+**面板显示"已注入，但任务栏符号不可用"**
+hook 进了 explorer，但 `taskbar.dll` 的符号没解析出来，此时任何亮度/不透明度调整都不会生效。
+程序会自动重下符号（每 30 秒重试一次），日志里能看到原因；仍不行见下一条。
+
 **注入成功但任务栏没变化**
 先看日志里符号有没有就位：
-- `taskbar symbols unavailable: ...` —— 符号没取到。可能没联网（PDB 需要从 `msdl.microsoft.com` 下载一次），或这个 build 的 PDB 没有发布。此时程序**不会**去碰任务栏，也不会用扫描兜底：兜底路径会破坏 explorer 的 XAML 状态。
+- `taskbar symbols unavailable: ...` —— 符号没取到。可能没联网（PDB 需要从 `msdl.microsoft.com` 下载一次），或这个 build 的 PDB 没有发布。此时程序**不会**去碰任务栏，也不会用扫描兜底：兜底路径会破坏 explorer 的 XAML 状态。失败不会永久放弃，30 秒后自动重试。
+- `discarding the cached pdb` / `cached pdb ... does not belong to ...` —— 缓存里的 PDB 属于另一个 `taskbar.dll`（通常是系统更新之后），程序已经自己删掉重下。
 - `no ITaskListWndSite sub-object within 20 slots` —— 找到了 taskband 窗口，但 CTaskBand 的对象布局变了，需要按上游模块的做法核对虚表匹配。
 - `TaskbarHost+0x.. is not a FrameworkElement` —— 元素偏移没对上，`TaskbarHost::FrameHeight` 的序言格式变了（日志里会打印实际使用的偏移）。
 - `icon and text layer is empty, taskbar not laid out yet` —— 任务栏还没布局完，程序会在 1.2 秒后重试（连续失败 5 次后转为 30 秒一次，不再刷屏）。

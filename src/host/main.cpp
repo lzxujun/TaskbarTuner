@@ -49,10 +49,18 @@ UINT g_taskbarCreatedMessage = 0;
 tuner::Config g_config;
 bool g_lastShowAllTray = false;
 bool g_hookReady = false;
+// Whether the hook resolved taskbar.dll's symbols. The hook window appears even
+// when it did not, and then every slider move is a silent no-op.
+bool g_symbolsReady = true;
 
 void UpdateTrayTip() {
-    wcscpy_s(g_trayIcon.szTip,
-             g_hookReady ? L"任务栏调节器 - 已生效" : L"任务栏调节器 - 未连接");
+    const wchar_t* tip = L"任务栏调节器 - 未连接";
+    if (g_hookReady) {
+        tip = g_symbolsReady ? L"任务栏调节器 - 已生效"
+                             : L"任务栏调节器 - 已注入，符号缺失";
+    }
+
+    wcscpy_s(g_trayIcon.szTip, tip);
     Shell_NotifyIconW(NIM_MODIFY, &g_trayIcon);
 }
 
@@ -92,10 +100,26 @@ void SyncToHook() {
         }
     }
 
+    // Asked before the settings are pushed: the hook thread that answers this is
+    // idle now, and busy applying right after. A hook that cannot resolve
+    // taskbar.dll's symbols is fully injected and completely ineffective, which
+    // used to be reported as "connected" and was impossible to notice.
+    g_symbolsReady = tuner::IsHookSymbolsReady();
+
     tuner::PushConfig(g_config);
     g_hookReady = true;
-    g_panel->SetStatusText(g_config.enabled ? L"已连接到任务栏" : L"效果已暂停",
-                           false);
+
+    if (!g_config.enabled) {
+        g_panel->SetStatusText(L"效果已暂停", false);
+    } else if (!g_symbolsReady) {
+        g_panel->SetStatusText(
+            L"已注入，但任务栏符号不可用，效果不会生效。"
+            L"程序会自动重新下载符号，详见日志。",
+            true);
+    } else {
+        g_panel->SetStatusText(L"已连接到任务栏", false);
+    }
+
     UpdateTrayTip();
 }
 

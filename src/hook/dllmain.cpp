@@ -369,6 +369,12 @@ LRESULT CALLBACK HookWindowProc(HWND hWnd, UINT message, WPARAM wParam,
         return 0;
     }
 
+    if (message == tuner::kMsgHookStatus) {
+        // Answered without starting a resolution: this runs on the hook thread
+        // while the host waits with a short timeout.
+        return tuner::hook::TaskbarSymbolsReady() ? 1 : 0;
+    }
+
     if (message == tuner::kMsgShutdown) {
         // Unload for real: the host sends this when it is going away for good,
         // so a later start injects the current build instead of finding a stale

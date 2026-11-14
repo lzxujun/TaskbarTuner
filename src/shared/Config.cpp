@@ -123,6 +123,25 @@ HWND FindHookWindow() {
     return FindWindowW(kHookWindowClass, kHookWindowTitle);
 }
 
+bool IsHookSymbolsReady() {
+    HWND hookWnd = FindHookWindow();
+    if (!hookWnd) {
+        return false;
+    }
+
+    DWORD_PTR ready = 0;
+    // Short timeout on purpose: this runs on the host UI thread while the user
+    // drags a slider, so a hook that is busy applying must not stall it. A
+    // timeout counts as "ready" - the hook logs its own failures, and a false
+    // warning would be worse than none.
+    if (!SendMessageTimeoutW(hookWnd, kMsgHookStatus, 0, 0,
+                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 200, &ready)) {
+        return true;
+    }
+
+    return ready != 0;
+}
+
 void RequestHookSuspend() {
     if (HWND hookWnd = FindHookWindow()) {
         PostMessageW(hookWnd, kMsgSuspend, 0, 0);

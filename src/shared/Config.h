@@ -24,6 +24,11 @@ constexpr UINT kMsgSettingsChanged = WM_APP + 0x51;
 constexpr UINT kMsgShutdown = WM_APP + 0x52;      // restore and unload
 constexpr UINT kMsgSuspend = WM_APP + 0x53;       // restore, stay loaded
 
+// Host -> hook, answered with 1 when the taskbar symbols are resolved. Without
+// it the host cannot tell whether the injected hook can actually do anything:
+// the hook window exists either way.
+constexpr UINT kMsgHookStatus = WM_APP + 0x54;
+
 // Hook -> host.
 constexpr UINT kMsgHookReady = WM_APP + 0x61;
 
@@ -62,6 +67,11 @@ bool PushConfig(const Config& config);
 
 // Locates the hook window inside explorer.exe.
 HWND FindHookWindow();
+
+// Asks the hook whether its taskbar symbols are resolved. Returns true when the
+// hook does not answer: a slow or busy hook must not be reported as broken, and
+// the failed apply is logged by the hook itself.
+bool IsHookSymbolsReady();
 
 // Puts the taskbar back to its original appearance without changing what is
 // stored. Used when the program exits: the look should be restored, but the

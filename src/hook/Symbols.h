@@ -11,10 +11,12 @@
 // ships dbghelp.dll but not symsrv.dll, so dbghelp cannot fetch symbols from
 // msdl.microsoft.com on its own. Instead the PDB is fetched by this module
 // directly from the public symbol server, keyed by the exact signature stored in
-// taskbar.dll, and handed to dbghelp as a plain local file. A PDB whose GUID/Age
-// does not match the DLL can therefore never be picked up by accident, which is
-// what made the "symbols loaded but every query fails" behaviour of the original
-// attempt so confusing.
+// taskbar.dll, and handed to dbghelp as a plain local file.
+//
+// The cache is validated against that signature before every use: dbghelp does
+// not report a mismatched PDB as an error, it simply maps no symbol, which looks
+// exactly like an unsupported build and used to leave the program running with
+// every brightness and opacity change silently doing nothing.
 #pragma once
 
 #include <windows.h>
@@ -51,6 +53,11 @@ struct TaskbarSymbols {
 // the hook worker thread; never call it from the taskbar UI thread because it
 // may download a PDB.
 bool EnsureTaskbarSymbols(std::wstring& error);
+
+// Whether the symbols are resolved, without starting an attempt. The host uses
+// it to tell "connected" apart from "injected, but this taskbar build cannot be
+// resolved", which otherwise look identical from the outside.
+bool TaskbarSymbolsReady();
 
 const TaskbarSymbols& GetTaskbarSymbols();
 

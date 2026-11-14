@@ -6,6 +6,7 @@
 #include <urlmon.h>
 
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -45,11 +46,25 @@ const SymbolRequest kRequests[] = {
 
 TaskbarSymbols g_symbols;
 bool g_resolved = false;
-// Resolution can fail for a transient reason (no network for the PDB), but a
-// permanent one (unsupported build) must not be retried on every apply pass.
-int g_attempts = 0;
-constexpr int kMaxAttempts = 3;
+// dbghelp is initialised once per process and a module can only be loaded once,
+// so both are tracked: the old code called SymInitialize/SymLoadModuleEx again
+// on every retry, which is why attempts two and three failed with a bare
+// "error 0" and the retry loop could never recover.
+bool g_dbghelpReady = false;
+DWORD64 g_loadedBase = 0;
+// Resolution is reached from the hook worker thread and, later, from the taskbar
+// UI thread, so it has to be serialised.
+std::mutex g_resolveLock;
+// A failed attempt is retried after this delay instead of giving up for the rest
+// of the session: the first attempt often happens at logon, before the network
+// is up.
+constexpr ULONGLONG kRetryDelayMs = 30000;
+ULONGLONG g_retryAfter = 0;
+// The cache is dropped and downloaded again at most once per process, so an
+// unsupported build cannot turn into a download loop.
+bool g_cacheRefreshed = false;
 std::wstring g_lastError;
+std::wstring g_loggedError;
 std::wstring g_pdbPath;
 HMODULE g_taskbarModule = nullptr;
 DWORD64 g_taskbarBase = 0;
@@ -71,6 +86,39 @@ std::wstring SymbolCacheDir() {
     CreateDirectoryW((LocalAppData() + L"\\TaskbarTuner").c_str(), nullptr);
     CreateDirectoryW(dir.c_str(), nullptr);
     return dir;
+}
+
+// SymInitializeW only takes effect the first time it is called for a process;
+// the search path it records is the one dbghelp keeps using, and the cache
+// directory never changes, so initialising once is both correct and the only
+// thing that works.
+bool EnsureDbgHelp(const std::wstring& cacheDir, std::wstring& error) {
+    if (g_dbghelpReady) {
+        return true;
+    }
+
+    if (!SymInitializeW(GetCurrentProcess(), cacheDir.c_str(), FALSE)) {
+        wchar_t buffer[96]{};
+        swprintf_s(buffer, L"SymInitialize 失败（%lu）", GetLastError());
+        error = buffer;
+        return false;
+    }
+
+    SymSetOptions(SYMOPT_FAIL_CRITICAL_ERRORS);
+    g_dbghelpReady = true;
+    return true;
+}
+
+// Releases taskbar.dll and the PDB dbghelp mapped for it. Needed before a fresh
+// PDB can be loaded, and before the stale cache file can be deleted - dbghelp
+// keeps it mapped, and a mapped file cannot be removed.
+void UnloadTaskbarModule() {
+    if (!g_loadedBase) {
+        return;
+    }
+
+    SymUnloadModule64(GetCurrentProcess(), g_loadedBase);
+    g_loadedBase = 0;
 }
 
 // Reads the CodeView record of a PE image: the PDB file name and the
@@ -169,14 +217,107 @@ bool ReadPdbSignature(const std::wstring& imagePath, std::wstring& pdbName,
     return ok;
 }
 
+// The cached PDB has to keep the exact name the CodeView record spells out,
+// because that is the only name dbghelp looks for in the directory it was given.
+// The build it belongs to therefore cannot be part of its name and is kept in a
+// companion ".key" file next to it.
+//
+// Checking only whether the file exists - what this used to do - means a PDB
+// fetched for an older taskbar.dll is reused forever: Windows updates the
+// taskbar, its signature changes, dbghelp loads the module but maps no symbol of
+// the stale PDB, and every lookup fails while the program still reports itself
+// as connected.
+std::wstring StampPath(const std::wstring& pdbPath) { return pdbPath + L".key"; }
+
+// The key is "<32 hex digits><age>", ASCII by construction.
+std::string AsciiKey(const std::wstring& key) {
+    std::string narrow;
+    narrow.reserve(key.size());
+    for (wchar_t ch : key) {
+        narrow.push_back(static_cast<char>(ch));
+    }
+    return narrow;
+}
+
+bool StampMatches(const std::wstring& pdbPath, const std::wstring& key) {
+    HANDLE file = CreateFileW(StampPath(pdbPath).c_str(), GENERIC_READ,
+                              FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    char buffer[64]{};
+    DWORD read = 0;
+    const bool ok =
+        ReadFile(file, buffer, sizeof(buffer) - 1, &read, nullptr) != 0;
+    CloseHandle(file);
+
+    if (!ok || read == 0) {
+        return false;
+    }
+
+    std::string stored(buffer, read);
+    while (!stored.empty() && (stored.back() == '\r' || stored.back() == '\n' ||
+                               stored.back() == ' ' || stored.back() == '\0')) {
+        stored.pop_back();
+    }
+
+    return stored == AsciiKey(key);
+}
+
+void WriteStamp(const std::wstring& pdbPath, const std::wstring& key) {
+    HANDLE file = CreateFileW(StampPath(pdbPath).c_str(), GENERIC_WRITE, 0,
+                              nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                              nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    const std::string narrow = AsciiKey(key);
+    DWORD written = 0;
+    WriteFile(file, narrow.data(), static_cast<DWORD>(narrow.size()), &written,
+              nullptr);
+    CloseHandle(file);
+}
+
+void DropCachedPdb(const std::wstring& pdbPath) {
+    if (pdbPath.empty()) {
+        return;
+    }
+
+    DeleteFileW((pdbPath + L".part").c_str());
+
+    // The stamp goes last and only when the file is really gone: keeping it
+    // would make the next start reuse the very file that was just rejected,
+    // while dropping it after a failed delete would download 7 MB again only to
+    // fail on the same locked file.
+    if (DeleteFileW(pdbPath.c_str()) == FALSE &&
+        GetFileAttributesW(pdbPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        TLOG(L"cannot delete %s (error %lu)", pdbPath.c_str(), GetLastError());
+        return;
+    }
+
+    DeleteFileW(StampPath(pdbPath).c_str());
+}
+
 // Downloads the PDB straight from the public symbol server. dbghelp cannot do
 // this by itself because symsrv.dll is not part of Windows.
 bool FetchPdb(const std::wstring& cacheDir, const std::wstring& pdbName,
               const std::wstring& key, std::wstring& error) {
     const std::wstring target = cacheDir + L"\\" + pdbName;
+
     if (GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        g_pdbPath = target;
-        return true;
+        if (StampMatches(target, key)) {
+            g_pdbPath = target;
+            return true;
+        }
+
+        // Present but not for this build of taskbar.dll - the situation after a
+        // Windows update. It has to go before dbghelp is pointed at it.
+        TLOG(L"cached pdb %s does not belong to %s, downloading again",
+             target.c_str(), key.c_str());
+        DropCachedPdb(target);
     }
 
     std::wstring url = L"https://msdl.microsoft.com/download/symbols/" + pdbName +
@@ -201,6 +342,7 @@ bool FetchPdb(const std::wstring& cacheDir, const std::wstring& pdbName,
         return false;
     }
 
+    WriteStamp(target, key);
     g_pdbPath = target;
     TLOG(L"pdb cached at %s", target.c_str());
     return true;
@@ -286,7 +428,13 @@ DWORD ImageSize(HMODULE module) {
 }
 
 // One full resolution attempt: locate taskbar.dll, stage its PDB, load symbols.
-bool ResolveSymbolsOnce(std::wstring& error) {
+//
+// `stale` is set when the module loaded but not one symbol could be resolved:
+// dbghelp accepted the image and mapped nothing, which in practice means the PDB
+// in the cache describes a different build. The caller uses it to throw the
+// cache away and try once more before falling back to the retry delay.
+bool ResolveSymbolsOnce(bool& stale, std::wstring& error) {
+    stale = false;
     g_taskbarModule = GetModuleHandleW(L"taskbar.dll");
     if (!g_taskbarModule) {
         g_taskbarModule =
@@ -319,16 +467,17 @@ bool ResolveSymbolsOnce(std::wstring& error) {
         return false;
     }
 
-    // dbghelp searches the directory it is given for "<pdbname>" and validates
-    // the signature inside the file, so a cached PDB from another build is
-    // rejected rather than silently accepted.
-    if (!SymInitializeW(GetCurrentProcess(), cacheDir.c_str(), FALSE)) {
-        wchar_t buffer[96]{};
-        swprintf_s(buffer, L"SymInitialize 失败（%lu）", GetLastError());
-        error = buffer;
+    // dbghelp searches the directory it is given for "<pdbname>". It does reject
+    // a PDB whose signature does not match the image, but it does so by loading
+    // no symbols at all rather than by failing the call, so the cache is
+    // validated before it is handed over (see FetchPdb).
+    if (!EnsureDbgHelp(cacheDir, error)) {
         return false;
     }
-    SymSetOptions(SYMOPT_FAIL_CRITICAL_ERRORS);
+
+    // A previous attempt may have loaded this module already. Unloading first is
+    // what makes a retry after a fresh download actually re-read the PDB.
+    UnloadTaskbarModule();
 
     const DWORD64 loaded = SymLoadModuleExW(
         GetCurrentProcess(), nullptr, modulePath, nullptr, g_taskbarBase, 0,
@@ -339,6 +488,7 @@ bool ResolveSymbolsOnce(std::wstring& error) {
         error = buffer;
         return false;
     }
+    g_loadedBase = loaded;
 
     const DWORD imageSizeBytes = ImageSize(g_taskbarModule);
     if (!imageSizeBytes) {
@@ -396,7 +546,8 @@ bool ResolveSymbolsOnce(std::wstring& error) {
     }
 
     if (missing) {
-        wchar_t buffer[96]{};
+        stale = missing == ARRAYSIZE(kRequests);
+        wchar_t buffer[128]{};
         swprintf_s(buffer, L"缺少 %zu 个任务栏符号", missing);
         error = buffer;
         return false;
@@ -415,28 +566,63 @@ bool ResolveSymbolsOnce(std::wstring& error) {
 }  // namespace
 
 bool EnsureTaskbarSymbols(std::wstring& error) {
+    std::lock_guard<std::mutex> guard(g_resolveLock);
+
     if (g_resolved) {
         return true;
     }
 
-    if (g_attempts >= kMaxAttempts) {
+    // A failed attempt is retried after a delay rather than being final: at
+    // logon the network is frequently not up yet, and giving up after three
+    // attempts left the rest of the session with a program that looked connected
+    // and did nothing.
+    const ULONGLONG now = GetTickCount64();
+    if (g_retryAfter && now < g_retryAfter) {
         error = g_lastError;
         return false;
     }
 
-    g_attempts++;
-    if (ResolveSymbolsOnce(error)) {
+    bool stale = false;
+    if (ResolveSymbolsOnce(stale, error)) {
         g_resolved = true;
+        g_lastError.clear();
+        g_loggedError.clear();
         return true;
     }
 
-    g_lastError = error;
-    if (g_attempts >= kMaxAttempts) {
-        TLOG(L"giving up on symbols after %d attempts: %s", g_attempts,
-             error.c_str());
+    // Not a single symbol resolved, so the cache most likely belongs to another
+    // build. Dropping it and downloading once more is the difference between
+    // "broken until the user finds this folder by hand" and "fixed by itself".
+    if (stale && !g_cacheRefreshed) {
+        g_cacheRefreshed = true;
+        TLOG(L"symbols did not resolve, discarding the cached pdb %s",
+             g_pdbPath.c_str());
+        UnloadTaskbarModule();
+        DropCachedPdb(g_pdbPath);
+
+        if (ResolveSymbolsOnce(stale, error)) {
+            g_resolved = true;
+            g_lastError.clear();
+            g_loggedError.clear();
+            return true;
+        }
     }
+
+    g_lastError = error;
+    g_retryAfter = GetTickCount64() + kRetryDelayMs;
+
+    // Logged once per distinct error: the probe runs every few seconds and used
+    // to write the same line thousands of times, megabytes of it.
+    if (error != g_loggedError) {
+        g_loggedError = error;
+        TLOG(L"taskbar symbols unavailable: %s (retrying every %llu s)",
+             error.c_str(), kRetryDelayMs / 1000);
+    }
+
     return false;
 }
+
+bool TaskbarSymbolsReady() { return g_resolved; }
 
 const TaskbarSymbols& GetTaskbarSymbols() { return g_symbols; }
 
